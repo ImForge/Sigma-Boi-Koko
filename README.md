@@ -48,8 +48,7 @@ Per-tab state is stored in `chrome.storage.local` and cleaned up automatically w
 
 ## Credits
 
-Big thanks to **[@Kokodaki](https://github.com/Kokodaki)** for the idea and the name.
+Big thanks to **[@Kokodaki](https://github.com/Kokodaki)** for the idea and the name. 
 
----
+FIRE EMOJI!!!
 
-Made by [ImForge](https://github.com/ImForge)
