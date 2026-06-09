@@ -22,29 +22,6 @@ A premium volume control extension for Chrome and Brave. Boost any tab up to **1
 4. Click **Load unpacked**
 5. Select the `sigma-boi-koko` folder
 
-## How it works
-
-The extension hooks into the browser's **Web Audio API** and inserts a processing chain into every page's audio:
-
-```
-source → GainNode → BassFilter → VoiceFilter → speakers
-```
-
-- **GainNode** controls overall volume (0–10x amplification)
-- **BiquadFilter (lowshelf)** at 80Hz handles bass boost
-- **BiquadFilter (peaking)** at 2.5kHz handles voice boost
-
-Per-tab state is stored in `chrome.storage.local` and cleaned up automatically when tabs close. The extension respects browser autoplay policy and only resumes suspended audio contexts after a user gesture.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `manifest.json` | Extension config (Manifest V3) |
-| `content.js` | Audio engine — runs inside every page |
-| `background.js` | Service worker — manages per-tab state |
-| `popup.html` | UI markup |
-| `popup.js` | UI logic |
 
 ## Credits
 
