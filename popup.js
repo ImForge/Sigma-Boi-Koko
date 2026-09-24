@@ -25,6 +25,7 @@ let isMuted          = false;
 let volumeBeforeMute = 100;
 let bassOn           = false;
 let voiceOn          = false;
+let lastError        = "";
 
 // ── UI RENDER ──
 function updateUI(volume, muted) {
@@ -33,7 +34,7 @@ function updateUI(volume, muted) {
   volumeNumber.textContent = volume;
   volInput.value = volume;
 
-  // Slider: clamp to max for visual — values above max just pin to the end
+  // Slider: clamp to max for visual. Values above max just pin to the end.
   volumeSlider.value = Math.min(volume, MAX_VOL);
 
   const fillPct = Math.min((volume / MAX_VOL) * 100, 100);
@@ -42,7 +43,10 @@ function updateUI(volume, muted) {
   trackFill.classList.toggle("muted", muted);
 
   statusLine.classList.remove("boosted", "muted");
-  if (muted) {
+  if (lastError) {
+    statusLine.textContent = lastError;
+    statusLine.classList.add("muted");
+  } else if (muted) {
     statusLine.textContent = "Muted";
     statusLine.classList.add("muted");
   } else if (volume === 0) {
@@ -70,28 +74,36 @@ function updateBoostUI() {
   voiceBtn.classList.toggle("voice-active", voiceOn);
 }
 
-// Pages where no content script can run (chrome://, brave://, the Web Store,
-// the PDF viewer, other extensions' pages…). Show that instead of dead controls.
-function setUnavailable() {
+// Pages that can't be captured (chrome://, brave://, the Web Store, other
+// extensions' pages). Show that instead of dead controls.
+function setUnavailable(text) {
   updateUI(100, false);
-  statusLine.textContent = "Not available on this page";
+  statusLine.textContent = text || "Not available on this page";
   tabBadge.textContent = "Tab —";
   CONTROLS.forEach((el) => { el.disabled = true; });
 }
 
 function isControllable(tab) {
   const url = tab.url || tab.pendingUrl || "";
-  if (!url) return true; // no URL access → assume a normal page
+  if (!url) return true; // no URL access: assume a normal page
   return /^(https?|file|ftp):/i.test(url);
 }
 
 // ── SEND MESSAGES ──
-function send(msg) {
-  chrome.runtime.sendMessage({ ...msg, tabId: currentTabId }).catch(() => {});
+// Every change goes to background.js, which stores it and pushes it to the
+// audio engine. The response tells us if the tab couldn't be captured.
+async function send(msg) {
+  try {
+    const r = await chrome.runtime.sendMessage({ ...msg, tabId: currentTabId });
+    lastError = r && r.ok === false ? (r.error || "Something went wrong") : "";
+  } catch (e) {
+    lastError = "Extension not responding. Reload it.";
+  }
+  updateUI(currentVolume, isMuted);
 }
-function sendVolume(volume, muted) { send({ type: "SET_VOLUME", volume, muted }); }
-function sendBass(enabled)         { send({ type: "SET_BASS_BOOST", enabled }); }
-function sendVoice(enabled)        { send({ type: "SET_VOICE_BOOST", enabled }); }
+function sendVolume(volume, muted) { return send({ type: "SET_VOLUME", volume, muted }); }
+function sendBass(enabled)         { return send({ type: "SET_BASS_BOOST", enabled }); }
+function sendVoice(enabled)        { return send({ type: "SET_VOICE_BOOST", enabled }); }
 
 function setVolume(v) {
   volumeBeforeMute = v;
@@ -132,12 +144,13 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       updateUI(100, false);
       return;
     }
-    const { volume, muted, bassBoost, voiceBoost } = response;
+    const { volume, muted, bassBoost, voiceBoost, capturing } = response;
     volumeBeforeMute = volume;
     bassOn  = Boolean(bassBoost);
     voiceOn = Boolean(voiceBoost);
     updateUI(volume, Boolean(muted));
     updateBoostUI();
+    if (capturing) tabBadge.textContent = "Tab " + tab.id + " · live";
   });
 });
 
@@ -163,7 +176,7 @@ muteBtn.addEventListener("click", () => {
     updateUI(restore, false);
     sendVolume(restore, false);
   } else {
-    // Use the real value, not the slider — the slider is clamped to MAX_VOL,
+    // Use the real value, not the slider: the slider is clamped to MAX_VOL,
     // so a typed 1500% used to come back as 1000% after unmuting.
     volumeBeforeMute = currentVolume;
     updateUI(currentVolume, true);
@@ -171,9 +184,17 @@ muteBtn.addEventListener("click", () => {
   }
 });
 
-// Reset
+// Reset: back to 100% and release the tab (native audio resumes)
 resetBtn.addEventListener("click", () => {
-  setVolume(100);
+  isMuted = false;
+  volumeBeforeMute = 100;
+  bassOn = false;
+  voiceOn = false;
+  updateBoostUI();
+  updateUI(100, false);
+  send({ type: "RESET" }).then(() => {
+    tabBadge.textContent = "Tab " + currentTabId;
+  });
 });
 
 // Bass boost
