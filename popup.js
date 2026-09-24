@@ -14,9 +14,13 @@ const voiceBtn      = document.getElementById("voiceBtn");
 const volInput      = document.getElementById("volInput");
 const setBtn        = document.getElementById("setBtn");
 
+const CONTROLS = [volumeSlider, volInput, setBtn, muteBtn, resetBtn, bassBtn, voiceBtn];
+
+// Slider range. The custom input deliberately has no upper cap.
 const MAX_VOL = 1000;
 
 let currentTabId     = null;
+let currentVolume    = 100;
 let isMuted          = false;
 let volumeBeforeMute = 100;
 let bassOn           = false;
@@ -24,11 +28,12 @@ let voiceOn          = false;
 
 // ── UI RENDER ──
 function updateUI(volume, muted) {
+  currentVolume = volume;
   isMuted = muted;
   volumeNumber.textContent = volume;
   volInput.value = volume;
 
-  // Slider: clamp to max for visual — values above max just pin to end
+  // Slider: clamp to max for visual — values above max just pin to the end
   volumeSlider.value = Math.min(volume, MAX_VOL);
 
   const fillPct = Math.min((volume / MAX_VOL) * 100, 100);
@@ -43,7 +48,7 @@ function updateUI(volume, muted) {
   } else if (volume === 0) {
     statusLine.textContent = "Silent";
   } else if (volume > 100) {
-    statusLine.textContent = "Boost \u00d7" + (volume / 100).toFixed(1);
+    statusLine.textContent = "Boost ×" + (volume / 100).toFixed(1);
     statusLine.classList.add("boosted");
   } else {
     statusLine.textContent = "Active";
@@ -65,45 +70,73 @@ function updateBoostUI() {
   voiceBtn.classList.toggle("voice-active", voiceOn);
 }
 
-// ── SEND MESSAGES ──
-function sendVolume(volume, muted) {
-  chrome.runtime.sendMessage({ type: "SET_VOLUME", tabId: currentTabId, volume, muted });
-}
-function sendBass(enabled) {
-  chrome.runtime.sendMessage({ type: "SET_BASS_BOOST", tabId: currentTabId, enabled });
-}
-function sendVoice(enabled) {
-  chrome.runtime.sendMessage({ type: "SET_VOICE_BOOST", tabId: currentTabId, enabled });
+// Pages where no content script can run (chrome://, brave://, the Web Store,
+// the PDF viewer, other extensions' pages…). Show that instead of dead controls.
+function setUnavailable() {
+  updateUI(100, false);
+  statusLine.textContent = "Not available on this page";
+  tabBadge.textContent = "Tab —";
+  CONTROLS.forEach((el) => { el.disabled = true; });
 }
 
-// Apply a specific volume value (used by both Set button and Enter key)
-function applyCustomVolume() {
-  let v = parseInt(volInput.value, 10);
-  if (isNaN(v) || v < 0) v = 0;
-  // No upper cap — user can type whatever they want
-  if (isMuted) isMuted = false;
+function isControllable(tab) {
+  const url = tab.url || tab.pendingUrl || "";
+  if (!url) return true; // no URL access → assume a normal page
+  return /^(https?|file|ftp):/i.test(url);
+}
+
+// ── SEND MESSAGES ──
+function send(msg) {
+  chrome.runtime.sendMessage({ ...msg, tabId: currentTabId }).catch(() => {});
+}
+function sendVolume(volume, muted) { send({ type: "SET_VOLUME", volume, muted }); }
+function sendBass(enabled)         { send({ type: "SET_BASS_BOOST", enabled }); }
+function sendVoice(enabled)        { send({ type: "SET_VOICE_BOOST", enabled }); }
+
+function setVolume(v) {
   volumeBeforeMute = v;
   updateUI(v, false);
   sendVolume(v, false);
 }
 
+// Apply a typed value (Set button and Enter key)
+function applyCustomVolume() {
+  const raw = volInput.value.trim();
+  let v = Math.floor(Number(raw));
+  if (raw === "" || !Number.isFinite(v)) {
+    // Empty / garbage input: don't silently set 0, just re-sync the field
+    volInput.value = currentVolume;
+    return;
+  }
+  if (v < 0) v = 0;
+  setVolume(v);
+}
+
 // ── INIT ──
 chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-  if (!tabs || tabs.length === 0) return;
-  const tab = tabs[0];
+  const tab = tabs && tabs[0];
+  if (!tab || tab.id == null) {
+    setUnavailable();
+    return;
+  }
   currentTabId = tab.id;
   tabBadge.textContent = "Tab " + tab.id;
 
+  if (!isControllable(tab)) {
+    setUnavailable();
+    return;
+  }
+
   chrome.runtime.sendMessage({ type: "GET_VOLUME", tabId: currentTabId }, (response) => {
-    if (chrome.runtime.lastError) {
+    if (chrome.runtime.lastError || !response) {
       updateUI(100, false);
       return;
     }
     const { volume, muted, bassBoost, voiceBoost } = response;
     volumeBeforeMute = volume;
-    bassOn  = bassBoost;
-    voiceOn = voiceBoost;
-    updateUI(volume, muted);
+    bassOn  = Boolean(bassBoost);
+    voiceOn = Boolean(voiceBoost);
+    updateUI(volume, Boolean(muted));
     updateBoostUI();
   });
 });
@@ -112,11 +145,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
 
 // Slider drag
 volumeSlider.addEventListener("input", () => {
-  const v = parseInt(volumeSlider.value, 10);
-  if (isMuted) isMuted = false;
-  volumeBeforeMute = v;
-  updateUI(v, false);
-  sendVolume(v, false);
+  setVolume(parseInt(volumeSlider.value, 10));
 });
 
 // Set button click
@@ -134,19 +163,17 @@ muteBtn.addEventListener("click", () => {
     updateUI(restore, false);
     sendVolume(restore, false);
   } else {
-    volumeBeforeMute = parseInt(volumeSlider.value, 10);
-    isMuted = true;
-    updateUI(volumeBeforeMute, true);
-    sendVolume(volumeBeforeMute, true);
+    // Use the real value, not the slider — the slider is clamped to MAX_VOL,
+    // so a typed 1500% used to come back as 1000% after unmuting.
+    volumeBeforeMute = currentVolume;
+    updateUI(currentVolume, true);
+    sendVolume(currentVolume, true);
   }
 });
 
 // Reset
 resetBtn.addEventListener("click", () => {
-  isMuted = false;
-  volumeBeforeMute = 100;
-  updateUI(100, false);
-  sendVolume(100, false);
+  setVolume(100);
 });
 
 // Bass boost

@@ -1,58 +1,89 @@
 // content.js
-// Audio chain: source → gainNode → bassFilter → voiceFilter → destination
+// Runs in every frame of every page (extension isolated world).
 //
-// Browser autoplay policy: AudioContext starts suspended until a user gesture.
-// We only call resume() from inside actual user-gesture event handlers,
-// never from timers/intervals (which would throw the error you saw).
+// Audio chain, built lazily — only once this tab is actually boosted, muted
+// or EQ'd:
+//   <video>/<audio> → MediaElementSource → gainNode → bassFilter → voiceFilter → destination
+//
+// Why lazy: routing a media element through Web Audio is one-way and has side
+// effects — cross-origin media without CORS headers goes silent, pages that
+// use Web Audio themselves can no longer connect the element, and a suspended
+// AudioContext silences autoplay. So we leave the page's audio path completely
+// untouched until the user changes something for this tab.
+//
+// Note: content scripts run in an isolated world, so patching
+// window.AudioContext here is never seen by page scripts. The old Proxy hook
+// on the constructor was dead code and has been removed.
 
 (function () {
   if (window.__sigmaBOIKOKO_injected) return;
   window.__sigmaBOIKOKO_injected = true;
+
+  const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!OriginalAudioContext) return;
+
+  const BASS_FREQ  = 80,   BASS_GAIN  = 10;
+  const VOICE_FREQ = 2500, VOICE_GAIN = 8;
+
+  // Desired state for this tab — mirrors what background.js has stored.
+  let volume       = 100;
+  let muted        = false;
+  let bassBoostOn  = false;
+  let voiceBoostOn = false;
 
   let audioCtx    = null;
   let gainNode    = null;
   let bassFilter  = null;
   let voiceFilter = null;
 
-  let currentGain  = 1.0;
-  let bassBoostOn  = false;
-  let voiceBoostOn = false;
+  // Media elements already routed (or that we tried to route) through the chain.
+  const hooked = new WeakSet();
 
-  const BASS_FREQ  = 80,   BASS_GAIN  = 10;
-  const VOICE_FREQ = 2500, VOICE_GAIN = 8;
+  // Autoplay policy: an AudioContext created before a user gesture starts
+  // suspended. We only call resume() after a gesture on the page or an
+  // explicit change from the popup, so we don't spam the console at load.
+  let resumeAllowed = false;
 
-  // Track whether we've gotten at least one user gesture on this page.
-  // Once true, all future audio contexts can be resumed safely.
-  let userGestureSeen = false;
-
-  // ── SAFE RESUME ──
-  // Only resumes if we've already seen a user gesture. Silently no-ops otherwise.
-  // This prevents the "must be resumed after user gesture" console error.
-  function safeResume() {
-    if (!userGestureSeen) return;
-    if (audioCtx && audioCtx.state === "suspended") {
-      audioCtx.resume().catch(() => {});
-    }
+  function num(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  function isDefaultState() {
+    return volume === 100 && !muted && !bassBoostOn && !voiceBoostOn;
+  }
+  function targetGain() {
+    return muted ? 0 : Math.max(0, volume) / 100;
+  }
+  // Once the chain exists we keep routing new media elements through it
+  // (gain 1.0 is a transparent passthrough); before that, only when needed.
+  function shouldHook() {
+    return audioCtx !== null || !isDefaultState();
   }
 
-  // ── USER GESTURE LISTENERS ──
-  // First real user interaction unlocks audio for the rest of the page session.
+  function safeResume() {
+    if (!resumeAllowed || !audioCtx) return;
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+  }
+
   function onFirstGesture() {
-    userGestureSeen = true;
+    resumeAllowed = true;
     safeResume();
   }
-
-  const GESTURE_EVENTS = ["click", "keydown", "pointerdown", "touchstart"];
-  GESTURE_EVENTS.forEach(evt => {
+  ["click", "keydown", "pointerdown", "touchstart"].forEach((evt) => {
     document.addEventListener(evt, onFirstGesture, { passive: true, capture: true });
   });
 
-  // ── BUILD AUDIO CHAIN ──
-  function buildChain(ctx) {
-    audioCtx = ctx;
+  function ensureChain() {
+    if (audioCtx) return true;
+    let ctx;
+    try {
+      ctx = new OriginalAudioContext();
+    } catch (e) {
+      return false;
+    }
 
     gainNode = ctx.createGain();
-    gainNode.gain.value = currentGain;
+    gainNode.gain.value = targetGain();
 
     bassFilter = ctx.createBiquadFilter();
     bassFilter.type = "lowshelf";
@@ -68,122 +99,96 @@
     gainNode.connect(bassFilter);
     bassFilter.connect(voiceFilter);
     voiceFilter.connect(ctx.destination);
+
+    audioCtx = ctx;
+    return true;
   }
 
-  function connectSource(source) {
-    if (!gainNode) return;
-    source.connect(gainNode);
-  }
-
-  // ── HOOK AudioContext CONSTRUCTOR ──
-  const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!OriginalAudioContext) return;
-
-  window.AudioContext = window.webkitAudioContext = new Proxy(OriginalAudioContext, {
-    construct(Target, args) {
-      const ctx = new Target(...args);
-      buildChain(ctx);
-
-      const origCMES = ctx.createMediaElementSource.bind(ctx);
-      ctx.createMediaElementSource = function (el) {
-        const source = origCMES(el);
-        connectSource(source);
-        return source;
-      };
-
-      const origCMSS = ctx.createMediaStreamSource.bind(ctx);
-      ctx.createMediaStreamSource = function (stream) {
-        const source = origCMSS(stream);
-        connectSource(source);
-        return source;
-      };
-
-      return ctx;
-    }
-  });
-
-  // ── HOOK MEDIA ELEMENTS DIRECTLY ──
   function hookMediaElement(el) {
-    if (el.__sbk_hooked) return;
-    el.__sbk_hooked = true;
-
-    if (!audioCtx) {
-      try {
-        const ctx = new OriginalAudioContext();
-        buildChain(ctx);
-      } catch (e) {
-        return;
-      }
-    }
-
+    if (hooked.has(el)) return;
+    if (!ensureChain()) return;
+    hooked.add(el); // mark even on failure so we don't retry on every scan
     try {
-      const source = audioCtx.createMediaElementSource(el);
-      connectSource(source);
-      safeResume();
+      audioCtx.createMediaElementSource(el).connect(gainNode);
     } catch (e) {
-      // Cross-origin / already connected — ignore
+      // Element already belongs to another AudioContext (the page's own EQ /
+      // visualiser). Nothing we can do — leave the page's audio alone.
+      return;
     }
+    // Playback starting is a good moment to make sure our context is running.
+    el.addEventListener("play", safeResume, { passive: true });
+    safeResume();
   }
 
-  document.querySelectorAll("video, audio").forEach(hookMediaElement);
+  function forEachMedia(root, fn) {
+    root.querySelectorAll?.("video, audio").forEach(fn);
+  }
 
-  // Watch for new media elements appearing dynamically
-  const observer = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      for (const node of mutation.addedNodes) {
+  function hookAll() {
+    if (!shouldHook()) return;
+    forEachMedia(document, hookMediaElement);
+  }
+
+  function applyState() {
+    if (!shouldHook()) return; // default state, nothing routed → stay hands-off
+    hookAll();
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    gainNode.gain.setTargetAtTime(targetGain(), t, 0.01);
+    bassFilter.gain.setTargetAtTime(bassBoostOn ? BASS_GAIN : 0, t, 0.02);
+    voiceFilter.gain.setTargetAtTime(voiceBoostOn ? VOICE_GAIN : 0, t, 0.02);
+    safeResume();
+  }
+
+  // Media elements added dynamically (SPAs, embedded players).
+  new MutationObserver((mutations) => {
+    if (!shouldHook()) return;
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
         if (node.matches?.("video, audio")) hookMediaElement(node);
-        node.querySelectorAll?.("video, audio").forEach(hookMediaElement);
+        forEachMedia(node, hookMediaElement);
       }
     }
-  });
+  }).observe(document, { childList: true, subtree: true });
 
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  // Belt-and-braces scan for anything the observer missed (X/Twitter
+  // re-parents players in ways that don't always surface as addedNodes).
+  setInterval(hookAll, 2000);
 
-  // Periodic scan for any unhooked media elements (X/Twitter, embedded players)
-  // This only HOOKS — it does NOT call resume() without a gesture.
-  setInterval(() => {
-    document.querySelectorAll("video, audio").forEach(el => {
-      if (!el.__sbk_hooked) hookMediaElement(el);
-    });
-  }, 2000);
-
-  // ── MESSAGE HANDLER ──
-  // Messages from the popup count as a user-initiated event,
-  // so we can safely resume here too.
+  // Changes pushed from the popup via background.js.
   chrome.runtime.onMessage.addListener((message) => {
-    // Treat any popup interaction as a user gesture
-    userGestureSeen = true;
-
-    if (message.type === "APPLY_VOLUME") {
-      currentGain = message.volume / 100;
-      if (gainNode) {
-        gainNode.gain.setTargetAtTime(currentGain, audioCtx.currentTime, 0.01);
-      }
-      safeResume();
+    if (!message || typeof message.type !== "string") return;
+    switch (message.type) {
+      case "APPLY_VOLUME":
+        volume = num(message.volume, 100);
+        muted  = Boolean(message.muted);
+        break;
+      case "APPLY_BASS_BOOST":
+        bassBoostOn = Boolean(message.enabled);
+        break;
+      case "APPLY_VOICE_BOOST":
+        voiceBoostOn = Boolean(message.enabled);
+        break;
+      default:
+        return;
     }
-
-    if (message.type === "APPLY_BASS_BOOST") {
-      bassBoostOn = message.enabled;
-      if (bassFilter) {
-        bassFilter.gain.setTargetAtTime(
-          bassBoostOn ? BASS_GAIN : 0,
-          audioCtx.currentTime, 0.02
-        );
-      }
-      safeResume();
-    }
-
-    if (message.type === "APPLY_VOICE_BOOST") {
-      voiceBoostOn = message.enabled;
-      if (voiceFilter) {
-        voiceFilter.gain.setTargetAtTime(
-          voiceBoostOn ? VOICE_GAIN : 0,
-          audioCtx.currentTime, 0.02
-        );
-      }
-      safeResume();
-    }
+    // The user just interacted with the popup — worth trying to resume.
+    resumeAllowed = true;
+    applyState();
   });
 
+  // Restore this tab's saved state after a reload / navigation.
+  try {
+    chrome.runtime.sendMessage({ type: "GET_VOLUME" }, (state) => {
+      if (chrome.runtime.lastError || !state) return;
+      volume       = num(state.volume, 100);
+      muted        = Boolean(state.muted);
+      bassBoostOn  = Boolean(state.bassBoost);
+      voiceBoostOn = Boolean(state.voiceBoost);
+      applyState();
+    });
+  } catch (e) {
+    // Extension context invalidated (extension was reloaded under this page).
+  }
 })();

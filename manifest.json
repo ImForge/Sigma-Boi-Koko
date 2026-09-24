@@ -1,18 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Sigma Boi Koko",
-  "version": "1.0.0",
-  "description": "Per-tab volume control. Boost up to 600%. No cap.",
+  "version": "1.1.0",
+  "description": "Per-tab volume control. Boost any tab up to 1000% on the slider (or type any value), with bass and voice boost.",
 
   "permissions": [
     "storage",
-    "tabs",
-    "scripting",
     "activeTab"
-  ],
-
-  "host_permissions": [
-    "<all_urls>"
   ],
 
   "background": {
@@ -32,7 +26,9 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
 

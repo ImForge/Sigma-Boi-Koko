@@ -150,15 +150,29 @@
     }
     input[type="range"]:active::-webkit-slider-thumb { transform: scale(0.9); }
 
+    /* Labels sit under the slider position they refer to (100 -> 10%, 500 -> 50%) */
     .scale {
-      display: flex;
-      justify-content: space-between;
-      padding: 6px 0 0;
+      position: relative;
+      height: 14px;
+      margin-top: 6px;
     }
     .scale span {
+      position: absolute;
+      top: 0;
+      transform: translateX(-50%);
       font-size: 10px;
       color: rgba(255,255,255,0.15);
       letter-spacing: 0.06em;
+      white-space: nowrap;
+    }
+    .scale span:first-child { transform: none; }
+    .scale span:nth-child(2) { transform: none; } /* left-anchored so it doesn't crowd the 0 */
+    .scale span:last-child  { transform: translateX(-100%); }
+
+    button:disabled,
+    input:disabled {
+      opacity: 0.35;
+      pointer-events: none;
     }
 
     /* CUSTOM VALUE INPUT */
@@ -370,10 +384,10 @@
       <input type="range" id="volumeSlider" min="0" max="1000" value="100" step="1" />
     </div>
     <div class="scale">
-      <span>0</span>
-      <span>100%</span>
-      <span>500%</span>
-      <span>1000%</span>
+      <span style="left: 0%">0</span>
+      <span style="left: 10%">100%</span>
+      <span style="left: 50%">500%</span>
+      <span style="left: 100%">1000%</span>
     </div>
   </div>
 
